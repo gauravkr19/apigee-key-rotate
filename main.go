@@ -17,10 +17,12 @@ import (
 	"sync"
 	"time"
 
+	metrics "github.com/gauravkr19/apigee-key-rotate/metrics"
 	vault "github.com/hashicorp/vault/api"
 	"gopkg.in/yaml.v3"
 )
 
+// var _ = prometheus.Handler() // Deprecated, but ensures import is used
 // VaultClient holds the Vault API client
 type VaultClient struct {
 	Client            *vault.Client
@@ -874,10 +876,10 @@ func (vc *VaultClient) hasExpirationTrackerEntry(appName string) bool {
 
 func main() {
 	// Initialize Prometheus metrics
-	initMetrics()
+	metrics.InitMetrics()
 
 	// Start HTTP server for Prometheus metrics
-	startMetricsServer()
+	metrics.StartMetricsServer()
 
 	// Initialize Apigee config and HTTP client
 	if err := initializeApigeeConfig(); err != nil {

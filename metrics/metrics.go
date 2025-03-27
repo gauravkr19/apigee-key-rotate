@@ -1,4 +1,4 @@
-package main
+package metrics
 
 import (
 	"net/http"
@@ -17,12 +17,12 @@ var apigeeSecretRotate = prometheus.NewGaugeVec(
 )
 
 // Initialize and register metrics
-func initMetrics() {
+func InitMetrics() {
 	prometheus.MustRegister(apigeeSecretRotate)
 }
 
 // Expose Prometheus metrics
-func startMetricsServer() {
+func StartMetricsServer() {
 	http.Handle("/metrics", promhttp.Handler())
 	go func() {
 		http.ListenAndServe(":8080", nil) // Change port if needed
