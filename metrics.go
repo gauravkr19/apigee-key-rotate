@@ -1,0 +1,30 @@
+package main
+
+import (
+	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// Custom metric for Apigee key rotation
+var apigeeSecretRotate = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name: "apigee_secret_rotate",
+		Help: "Tracks Apigee key rotation per app",
+	},
+	[]string{"appName", "TTL", "KeyCount"},
+)
+
+// Initialize and register metrics
+func initMetrics() {
+	prometheus.MustRegister(apigeeSecretRotate)
+}
+
+// Expose Prometheus metrics
+func startMetricsServer() {
+	http.Handle("/metrics", promhttp.Handler())
+	go func() {
+		http.ListenAndServe(":8080", nil) // Change port if needed
+	}()
+}
