@@ -81,7 +81,7 @@ func NewVaultClient() (*VaultClient, error) {
 	vaultAddr := os.Getenv("VAULT_ADDR")
 	vaultRole := os.Getenv("VAULT_ROLE")
 	vaultAuthMethod := os.Getenv("VAULT_AUTH_METHOD")
-	useTLS := os.Getenv("VAULT_USE_TLS") != "true" // Defaults to false
+	useTLS := os.Getenv("VAULT_USE_TLS") == "false" // Defaults to false
 
 	config := vault.DefaultConfig()
 	config.Address = vaultAddr
@@ -442,8 +442,6 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 	cleanupOldKeysTicker := time.NewTicker(keyDeletionDuration) // Used for cleaning up old keys
 	defer cleanupOldKeysTicker.Stop()
 
-	lastKeyCounts := make(map[string]int) // Store last fetched key counts
-
 	for {
 		select {
 		case <-ticker.C:
@@ -463,12 +461,10 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 					continue
 				}
 
-				ttlMinutes := int64(getNextCronTime().Sub(now).Minutes()) // ttl for prometheus metrics
+				ttlMinutes := time.Until(expTime).Minutes()
 
 				// Update Prometheus metric for TTL
-				metrics.ApigeeSecretRotate.WithLabelValues(
-					app.AppName, fmt.Sprintf("%d", ttlMinutes),
-				).Set(float64(lastKeyCounts[app.AppName]))
+				metrics.ApigeeKeyTTL.WithLabelValues(app.AppName).Set(ttlMinutes)
 
 				if now.After(expTime) {
 					log.Printf("TTL expired for %s, triggering key rotation...", app.AppName)
@@ -831,7 +827,31 @@ func (vc *VaultClient) hasExpirationTrackerEntry(appName string) bool {
 	return exists
 }
 
+// Required environment variables
+var requiredEnvVars = []string{
+	"VAULT_ADDR",
+	"VAULT_ROLE",
+	"VAULT_AUTH_METHOD",
+	"VAULT_USE_TLS",
+	"APIGEE_URL",
+	"APIGEE_USERNAME",
+	"APIGEE_PASSWORD",
+	"APIGEE_SKIP_TLS_VERIFY",
+	"KEY_ROTATION_CHECK_INTERVAL",
+	"KEY_DELETION_INTERVAL",
+	"TTL_CRON",
+}
+
+func checkEnvVars() {
+	for _, env := range requiredEnvVars {
+		if os.Getenv(env) == "" {
+			log.Fatalf("Error: Required environment variable %s is not set", env)
+		}
+	}
+}
+
 func main() {
+	checkEnvVars()
 	// Initialize Prometheus metrics
 	metrics.InitMetrics()
 

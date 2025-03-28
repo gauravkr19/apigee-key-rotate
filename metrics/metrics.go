@@ -7,18 +7,28 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Custom metric for Apigee key rotation
-var ApigeeSecretRotate = prometheus.NewGaugeVec(
-	prometheus.GaugeOpts{
-		Name: "apigee_secret_rotate",
-		Help: "Tracks Apigee key rotation per app",
-	},
-	[]string{"appName", "TTL"},
+// Define Prometheus Gauge metrics
+var (
+	ApigeeKeyTTL = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "apigee_key_ttl_minutes",
+			Help: "Time to live (TTL) in minutes for Apigee keys",
+		},
+		[]string{"app_name"}, // Only app name as a label
+	)
+
+	// apigeeKeyCount = prometheus.NewGaugeVec(
+	// 	prometheus.GaugeOpts{
+	// 		Name: "apigee_key_count",
+	// 		Help: "Number of Apigee keys for an app",
+	// 	},
+	// 	[]string{"app_name"},
+	// )
 )
 
 // Initialize and register metrics
 func InitMetrics() {
-	prometheus.MustRegister(ApigeeSecretRotate)
+	prometheus.MustRegister(ApigeeKeyTTL)
 }
 
 // Expose Prometheus metrics

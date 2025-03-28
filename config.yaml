@@ -1,0 +1,18 @@
+apps:
+  - org: "org-nonprod"
+    developer_email: "gaurav.kumar@example.com"
+    app_name: "My_New_App"
+    vault_path: "apigee/My_New_App/web/secret"
+    vault_mount: "apigee"  
+
+  - org: "org-nonprod"
+    developer_email: "gaurav.kumar@example.com"
+    app_name: "MyNewApp1"
+    vault_path: "apigee/MyNewApp1/finance/secret"    
+    vault_mount: "apigee"  
+
+  - org: "org-nonprod"
+    developer_email: "gaurav.kumar@example.com"
+    app_name: "New_App_test1"
+    vault_path: "apigee/New_App_test1/webdev/secret"  
+    vault_mount: "apigee"  
