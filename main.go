@@ -11,7 +11,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"sort"
 	"strconv"
 	"sync"
@@ -75,8 +74,7 @@ type ApigeeResponse struct {
 }
 
 var apigeeConfig ApigeeConfig // Global Apigee configuration
-var ttlDuration time.Duration // Validity of the apigee key, secret
-// var delayDeleteDuration time.Duration // Delay old key deletion after creating a new one
+var cronSchedule string       // Global variable to store user-defined cron
 
 // NewVaultClient initializes and returns a Vault API client
 func NewVaultClient() (*VaultClient, error) {
@@ -248,7 +246,7 @@ func (app *AppConfig) rotateApigeeKeys(vc *VaultClient) error {
 	}
 
 	// Print extracted values
-	log.Printf("--- %s App Name before key rotation ---", app.AppName)
+	log.Printf("--- %s App going ahead with key rotation ---", app.AppName)
 
 	// var wg sync.WaitGroup
 	if len(apiResp.Credentials) == 1 {
@@ -262,11 +260,11 @@ func (app *AppConfig) rotateApigeeKeys(vc *VaultClient) error {
 		log.Printf("New key added to %s app successfully \n", app.AppName)
 
 		// renew expiration time and update tracker and Vault
-		expTime := time.Now().Add(ttlDuration)
-		vc.expirationTracker[app.AppName] = expTime
+		newExpirationTime := getNextCronTime()
+		vc.expirationTracker[app.AppName] = newExpirationTime
 
 		// Write to Vault before deleting old key
-		err = vc.WriteToVault(*app, newKey, newSecret, expTime)
+		err = vc.WriteToVault(*app, newKey, newSecret, newExpirationTime)
 		if err != nil {
 			return fmt.Errorf("Failed to write secrets to Vault for %s: %v", app.AppName, err)
 			// Deletion interrupted due vault write issue, leading to key count more than 1
@@ -424,44 +422,33 @@ func ReadConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
-// parseTTL converts TTL string (e.g., "5m", "7d", "3h", "2mo") into a time.Duration.
-func parseTTL(ttlStr string) (time.Duration, error) {
-	// Define regex to match TTL formats: minutes (m), hours (h), days (d), months (mo)
-	re := regexp.MustCompile(`^(\d+)(m|h|d|mo)$`)
-	matches := re.FindStringSubmatch(ttlStr)
-
-	if len(matches) != 3 {
-		return 0, fmt.Errorf("unsupported TTL format: %s", ttlStr)
-	}
-
-	value, err := strconv.Atoi(matches[1]) // Extract the numeric value
-	if err != nil {
-		return 0, fmt.Errorf("invalid TTL value: %s", ttlStr)
-	}
-
-	unit := matches[2]
-	switch unit {
-	case "m": // Minutes
-		return time.Duration(value) * time.Minute, nil
-	case "h": // Hours
-		return time.Duration(value) * time.Hour, nil
-	case "d": // Days
-		return time.Duration(value*24) * time.Hour, nil
-	case "mo": // Months (approximated as 30 days)
-		return time.Duration(value*30*24) * time.Hour, nil
-	default:
-		return 0, fmt.Errorf("unsupported TTL unit: %s", ttlStr)
-	}
-}
-
 func (vc *VaultClient) expirationWatcher(config *Config) {
-	ticker := time.NewTicker(1 * time.Minute) // Watches the expiration time in the expirationTracker map
+
+	// TTL for key rotation
+	keyRotationCheckInterval := os.Getenv("KEY_ROTATION_CHECK_INTERVAL")
+	keyRotationCheckDuration, err := time.ParseDuration(keyRotationCheckInterval) // example values for env "5m", "1h", "30s", "24h", etc.
+	if err != nil || keyRotationCheckDuration <= 0 {
+		log.Fatalf("Invalid KEY_ROTATE_CHECK_INTERVAL: %v", err)
+	}
+	ticker := time.NewTicker(keyRotationCheckDuration) // Watches the expiration time in the expirationTracker map
 	defer ticker.Stop()
 
-	keyCountUpdateTicker := time.NewTicker(1 * time.Minute) // Fetch key count for metrics
+	// Interval for checking key count
+	keyCountCheckInterval := os.Getenv("KEY_COUNT_CHECK_INTERVAL")
+	keyCountCheckDuration, err := time.ParseDuration(keyCountCheckInterval)
+	if err != nil || keyCountCheckDuration <= 0 {
+		log.Fatalf("Invalid KEY_ROTATE_CHECK_INTERVAL: %v", err)
+	}
+	keyCountUpdateTicker := time.NewTicker(keyCountCheckDuration) // Fetch key count for metrics
 	defer keyCountUpdateTicker.Stop()
 
-	cleanupOldKeysTicker := time.NewTicker(1 * time.Minute) // Used for cleaning up old keys
+	// Key deletion interval
+	keyDeletionInterval := os.Getenv("KEY_DELETION_INTERVAL")
+	keyDeletionDuration, err := time.ParseDuration(keyDeletionInterval)
+	if err != nil || keyDeletionDuration <= 0 {
+		log.Fatalf("Invalid KEY_ROTATE_CHECK_INTERVAL: %v", err)
+	}
+	cleanupOldKeysTicker := time.NewTicker(keyDeletionDuration) // Used for cleaning up old keys
 	defer cleanupOldKeysTicker.Stop()
 
 	lastKeyCounts := make(map[string]int) // Store last fetched key counts
@@ -474,15 +461,18 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 			for i := range config.Apps {
 				app := &config.Apps[i]
 				expTime, exists := vc.expirationTracker[app.AppName]
-
 				if !exists {
 					log.Printf("WARNING: App %s not found in expirationTracker, skipping rotation check", app.AppName)
-					expirationTime := time.Now().Add(ttlDuration) // Set expiration using TTL
+					expirationTime := getNextCronTime() // Set expiration using cron
 					vc.expirationTracker[app.AppName] = expirationTime
+					err := vc.patchVaultExpiration(app, expirationTime)
+					if err != nil {
+						log.Printf("Failed to patch expiration for %s: %v", app.AppName, err)
+					}
 					continue
 				}
 
-				ttlMinutes := int64(expTime.Sub(now).Minutes())
+				ttlMinutes := int64(getNextCronTime().Sub(now).Minutes()) // ttl for prometheus metrics
 
 				// Update Prometheus metric for TTL and key count
 				metrics.ApigeeSecretRotate.WithLabelValues(
@@ -497,14 +487,10 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 						log.Printf("Failed to rotate key for %s: %v", app.AppName, err)
 						continue
 					}
-
-					// Update expirationTracker
-					newExpTime := now.Add(ttlDuration)
-					vc.expirationTracker[app.AppName] = newExpTime
 				}
 			}
 
-		case <-keyCountUpdateTicker.C: // Fetch key count every 1 hour
+		case <-keyCountUpdateTicker.C:
 			for i := range config.Apps {
 				app := &config.Apps[i]
 				credentials, err := app.fetchApigeeKeys()
@@ -520,7 +506,7 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 				).Set(float64(len(credentials)))
 			}
 
-		case <-cleanupOldKeysTicker.C: // Cleanup old keys every 72 hours
+		case <-cleanupOldKeysTicker.C:
 			log.Println("Running cleanup of old keys...")
 
 			for i := range config.Apps {
@@ -530,12 +516,13 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 					log.Printf("Failed to cleanup old keys for %s: %v", app.AppName, err)
 				}
 			}
+			log.Println("Old keys cleanup routine completed")
 		}
 	}
 }
 
 func (vc *VaultClient) cleanupOldKeys(app *AppConfig) error {
-	log.Printf("Starting key cleanup for %s...", app.AppName)
+	// log.Printf("Starting key cleanup for %s...", app.AppName)
 
 	// Step 1: Fetch all keys from Apigee
 	apigeeKeys, err := app.fetchApigeeKeys()
@@ -546,7 +533,7 @@ func (vc *VaultClient) cleanupOldKeys(app *AppConfig) error {
 
 	// Skip Vault check if only 1 key exists
 	if len(apigeeKeys) <= 1 {
-		log.Printf("Skipping cleanup for %s as only 1 key exists.", app.AppName)
+		// log.Printf("Skipping cleanup for %s as only 1 key exists.", app.AppName)
 		return nil
 	}
 
@@ -585,7 +572,7 @@ func (vc *VaultClient) cleanupOldKeys(app *AppConfig) error {
 
 func (app *AppConfig) deleteCleanup(keysToDelete []string) {
 	for _, key := range keysToDelete {
-		log.Printf("Deleting old key %s for app: %s now...", key, app.AppName)
+		log.Printf("Deleting old key for app: %s now...", app.AppName)
 
 		deleteURL := fmt.Sprintf("v1/organizations/%s/developers/%s/apps/%s/keys/%s",
 			app.Org, app.DeveloperEmail, app.AppName, key)
@@ -608,7 +595,7 @@ func (app *AppConfig) deleteCleanup(keysToDelete []string) {
 			continue
 		}
 
-		log.Printf("Successfully deleted key %s for %s", key, app.AppName)
+		log.Printf("Successfully deleted key for %s", app.AppName)
 	}
 }
 
@@ -727,40 +714,26 @@ func (vc *VaultClient) patchVaultExpiration(app *AppConfig, newExpiration time.T
 	return nil
 }
 
-// Converts a cron expression into a TTL duration
-func parseCronToDuration(cronExpr string) (time.Duration, error) {
-	schedule, err := cron.ParseStandard(cronExpr)
+// Computes the next scheduled expiration time based on the cron job
+func getNextCronTime() time.Time {
+	schedule, err := cron.ParseStandard(cronSchedule)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse cron expression: %w", err)
+		log.Fatalf("Failed to parse cron expression: %v", err)
 	}
 
 	now := time.Now()
-	nextRun := schedule.Next(now)
-
-	ttlDuration := nextRun.Sub(now)
-	return ttlDuration, nil
+	nextRun := schedule.Next(now) // Get the next cron execution time
+	return nextRun
 }
 
 // New
 func (vc *VaultClient) ValidateConfig(config *Config) {
 
-	// Read cron schedule from env
-	cronSchedule := os.Getenv("TTL_CRON") // Example: "0 0 * * 0" (Every Sunday)
-
-	// Convert cron schedule to duration
-	ttlDuration, err := parseCronToDuration(cronSchedule)
-	if err != nil {
+	cronSchedule = os.Getenv("TTL_CRON") // Example: "0 0 * * 0" (Every Sunday)
+	if _, err := cron.ParseStandard(cronSchedule); err != nil {
 		log.Fatalf("Invalid cron format: %v", err)
 	}
-	fmt.Println("TTL Duration:", ttlDuration)
-
-	// // Process TTL into duration to add to tracker
-	// ttlStr := os.Getenv("TTL")
-	// ttlDuration, err := parseTTL(ttlStr)
-	// fmt.Println("TTL:", ttlDuration)
-	// if err != nil {
-	// 	log.Fatalf("Invalid TTL format: %v", err)
-	// }
+	log.Println("Key expiration Time from cron:", getNextCronTime())
 
 	// Ensure expirationTracker, keyDeletionTracker is initialized
 	if vc.expirationTracker == nil {
@@ -777,10 +750,6 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 		var existsExpiration bool = false // Explicit reset
 
 		appData, existsInVault := vaultResults[app.AppName]
-		if err != nil {
-			log.Printf("Vault read failed for %s: %v\n", app.AppName, err)
-			continue
-		}
 
 		// Handle possible expirationTime types from KV-2
 		if rawExp, ok := appData["expirationTime"]; ok {
@@ -809,8 +778,9 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 			}
 			if expirationTime.Before(time.Now()) {
 				log.Printf("Vault's expirationTime field is invalid for %s. Resetting expiration time...\n", app.AppName)
-				newExpiration := time.Now().Add(ttlDuration)
+				newExpiration := getNextCronTime()
 				vc.expirationTracker[app.AppName] = newExpiration
+				app.ExpirationTime = newExpiration
 
 				// PATCH only expirationTime in Vault
 				err := vc.patchVaultExpiration(&app, newExpiration)
@@ -831,7 +801,7 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 				continue
 			}
 
-			expTime := time.Now().Add(ttlDuration) // Set expiration using TTL
+			expTime := getNextCronTime() // Set expiration using TTL
 			vc.expirationTracker[app.AppName] = expTime
 
 			// Write key & expiration to Vault
