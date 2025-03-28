@@ -8,7 +8,7 @@ import (
 )
 
 // Custom metric for Apigee key rotation
-var apigeeSecretRotate = prometheus.NewGaugeVec(
+var ApigeeSecretRotate = prometheus.NewGaugeVec(
 	prometheus.GaugeOpts{
 		Name: "apigee_secret_rotate",
 		Help: "Tracks Apigee key rotation per app",
@@ -18,7 +18,7 @@ var apigeeSecretRotate = prometheus.NewGaugeVec(
 
 // Initialize and register metrics
 func InitMetrics() {
-	prometheus.MustRegister(apigeeSecretRotate)
+	prometheus.MustRegister(ApigeeSecretRotate)
 }
 
 // Expose Prometheus metrics

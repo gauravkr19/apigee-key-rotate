@@ -19,6 +19,7 @@ import (
 
 	metrics "github.com/gauravkr19/apigee-key-rotate/metrics"
 	vault "github.com/hashicorp/vault/api"
+	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 )
 
@@ -26,7 +27,7 @@ import (
 // VaultClient holds the Vault API client
 type VaultClient struct {
 	Client            *vault.Client
-	expirationTracker map[string]time.Time
+	expirationTracker map[string]time.Time // Tracks when TTL expires
 }
 
 type Credential struct {
@@ -52,7 +53,6 @@ type AppConfig struct {
 	ConsumerKey    string
 	IssuedAt       time.Time
 	APIProducts    []string
-	CustomAttrs    map[string]string
 	ExpirationTime time.Time // New field to track expiration time
 }
 
@@ -75,7 +75,8 @@ type ApigeeResponse struct {
 }
 
 var apigeeConfig ApigeeConfig // Global Apigee configuration
-var ttlDuration time.Duration // Stores TTL duration
+var ttlDuration time.Duration // Validity of the apigee key, secret
+// var delayDeleteDuration time.Duration // Delay old key deletion after creating a new one
 
 // NewVaultClient initializes and returns a Vault API client
 func NewVaultClient() (*VaultClient, error) {
@@ -225,12 +226,6 @@ func (app *AppConfig) rotateApigeeKeys(vc *VaultClient) error {
 		return nil
 	}
 
-	// Initialize custom attributes map for this app
-	app.CustomAttrs = make(map[string]string)
-	for _, attr := range apiResp.Attributes {
-		app.CustomAttrs[attr.Name] = attr.Value
-	}
-
 	// Check if there are any credentials
 	if len(apiResp.Credentials) == 0 {
 		return fmt.Errorf("no credentials found for app %s", app.AppName)
@@ -253,10 +248,9 @@ func (app *AppConfig) rotateApigeeKeys(vc *VaultClient) error {
 	}
 
 	// Print extracted values
-	log.Println("--- Extracted Details before key rotation ---")
-	log.Println("App Name:", app.AppName)
+	log.Printf("--- %s App Name before key rotation ---", app.AppName)
 
-	var wg sync.WaitGroup
+	// var wg sync.WaitGroup
 	if len(apiResp.Credentials) == 1 {
 		// Generate secret text to use as key, secret
 		newKey, newSecret, err := generateCredentials()
@@ -268,11 +262,6 @@ func (app *AppConfig) rotateApigeeKeys(vc *VaultClient) error {
 		log.Printf("New key added to %s app successfully \n", app.AppName)
 
 		// renew expiration time and update tracker and Vault
-		ttlStr := os.Getenv("TTL")
-		ttlDuration, err := parseTTL(ttlStr)
-		if err != nil {
-			log.Fatalf("Invalid TTL format: %v", err)
-		}
 		expTime := time.Now().Add(ttlDuration)
 		vc.expirationTracker[app.AppName] = expTime
 
@@ -280,22 +269,10 @@ func (app *AppConfig) rotateApigeeKeys(vc *VaultClient) error {
 		err = vc.WriteToVault(*app, newKey, newSecret, expTime)
 		if err != nil {
 			return fmt.Errorf("Failed to write secrets to Vault for %s: %v", app.AppName, err)
+			// Deletion interrupted due vault write issue, leading to key count more than 1
 		}
-
-		// Invoke deletion of old key
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err = app.deleteOldApigeeKey()
-			if err != nil {
-				log.Printf("Failed to delete old key for %s: %v\n", app.AppName, err)
-			}
-		}()
-	}
-	wg.Wait() // Wait for the deletion to complete before returning
-
-	if len(apiResp.Credentials) != 1 {
-		log.Printf("Skipping the rotation, keys count is not equal to one for %s: \n", app.AppName)
+	} else {
+		return fmt.Errorf("Skipping the rotation, key count is %d for %s", len(apiResp.Credentials), app.AppName)
 	}
 	return nil
 }
@@ -320,12 +297,6 @@ func (app *AppConfig) fetchApigeeKeys() ([]Credential, error) {
 		return nil, err
 	}
 
-	// Initialize custom attributes map for this app
-	app.CustomAttrs = make(map[string]string)
-	for _, attr := range apiResp.Attributes {
-		app.CustomAttrs[attr.Name] = attr.Value
-	}
-
 	// Check if there are any credentials
 	if len(apiResp.Credentials) == 0 {
 		return nil, fmt.Errorf("no credentials found for app %s", app.AppName)
@@ -346,11 +317,6 @@ func (app *AppConfig) fetchApigeeKeys() ([]Credential, error) {
 	for _, product := range latestCredential.APIProducts {
 		app.APIProducts = append(app.APIProducts, product.APIProduct)
 	}
-
-	// Print extracted values
-	log.Println("--- Extracted Details ---")
-	log.Println("App Name:", app.AppName)
-
 	return apiResp.Credentials, nil
 }
 
@@ -412,71 +378,6 @@ func (app *AppConfig) createApigeeKey(key, secret string) error {
 	return nil
 }
 
-// deleteOldApigeeKey deletes the oldest key if exactly 2 keys exist
-func (app *AppConfig) deleteOldApigeeKey() error {
-	// Step 1: Fetch the existing keys
-	credentials, err := app.fetchApigeeKeys()
-	if err != nil {
-		return fmt.Errorf("error fetching credentials for %s: %v", app.AppName, err)
-	}
-
-	// Step 2: Apply deletion logic (delete only if exactly 2 keys exist)
-	if len(credentials) != 2 {
-		return fmt.Errorf("Skipping deletion as key count is %d for app %s: %v ", len(credentials), app.AppName, err)
-	}
-
-	// Step 3: Find the oldest key
-	oldestKey := credentials[0].ConsumerKey
-	oldestIssuedAt := credentials[0].IssuedAt
-	for _, cred := range credentials[1:] {
-		if cred.IssuedAt < oldestIssuedAt {
-			oldestKey = cred.ConsumerKey
-			oldestIssuedAt = cred.IssuedAt
-		}
-	}
-
-	// Step 4: Get delay duration (e.g., "5m", "7d", "3h", "2mo") from env var to delete old key, secret
-	keyDeletionDelayStr := os.Getenv("KEY_DELETION_DELAY")
-	keyDeletionDelay, err := parseTTL(keyDeletionDelayStr)
-
-	fmt.Println("keyDeletionDelay Duration", keyDeletionDelay)
-	if err != nil {
-		log.Printf("Invalid KEY_DELETION_DELAY: %v. Using default 6h.", err)
-		keyDeletionDelay = 6 * time.Hour // Fallback to default
-	}
-
-	log.Printf("Scheduling deletion of old key in %s for app: %s\n", keyDeletionDelay, app.AppName)
-
-	time.AfterFunc(keyDeletionDelay, func() {
-		log.Printf("Deleting old key for app: %s now...", app.AppName)
-
-		deleteURL := fmt.Sprintf("v1/organizations/%s/developers/%s/apps/%s/keys/%s",
-			app.Org, app.DeveloperEmail, app.AppName, oldestKey)
-
-		req, client, err := app.newApigeeRequest("DELETE", deleteURL, nil)
-		if err != nil {
-			log.Printf("Failed to create delete request for %s: %v", app.AppName, err)
-			return
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("Request failed for %s: %v", app.AppName, err)
-			return
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-			log.Printf("Failed to delete key for %s: received status %d", app.AppName, resp.StatusCode)
-			return
-		}
-
-		log.Printf("Successfully deleted oldest key for %s\n", app.AppName)
-	})
-
-	return nil
-}
-
 // generateSecureKey generates a secure key of the given length using a mix of uppercase, lowercase, and digits.
 func generateSecureKey(length int) (string, error) {
 	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
@@ -523,25 +424,7 @@ func ReadConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
-// parseTTL converts TTL string (e.g., "5m", "7d") into a time.Duration.
-// func parseTTL(ttlStr string) (time.Duration, error) {
-// 	if strings.HasSuffix(ttlStr, "m") { // Minutes
-// 		minutes, err := strconv.Atoi(strings.TrimSuffix(ttlStr, "m"))
-// 		if err != nil {
-// 			return 0, fmt.Errorf("invalid TTL format: %s", ttlStr)
-// 		}
-// 		return time.Duration(minutes) * time.Minute, nil
-// 	} else if strings.HasSuffix(ttlStr, "d") { // Days
-// 		days, err := strconv.Atoi(strings.TrimSuffix(ttlStr, "d"))
-// 		if err != nil {
-// 			return 0, fmt.Errorf("invalid TTL format: %s", ttlStr)
-// 		}
-// 		return time.Duration(days*24) * time.Hour, nil
-// 	}
-// 	return 0, fmt.Errorf("unsupported TTL format: %s", ttlStr)
-// }
-
-// parseTTL converts TTL/KEY_DELETION_DELAY string (e.g., "5m", "7d", "3h", "2mo") into a time.Duration.
+// parseTTL converts TTL string (e.g., "5m", "7d", "3h", "2mo") into a time.Duration.
 func parseTTL(ttlStr string) (time.Duration, error) {
 	// Define regex to match TTL formats: minutes (m), hours (h), days (d), months (mo)
 	re := regexp.MustCompile(`^(\d+)(m|h|d|mo)$`)
@@ -572,46 +455,160 @@ func parseTTL(ttlStr string) (time.Duration, error) {
 }
 
 func (vc *VaultClient) expirationWatcher(config *Config) {
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(1 * time.Minute) // Watches the expiration time in the expirationTracker map
 	defer ticker.Stop()
 
-	for range ticker.C {
-		now := time.Now()
+	keyCountUpdateTicker := time.NewTicker(1 * time.Minute) // Fetch key count for metrics
+	defer keyCountUpdateTicker.Stop()
 
-		for i := range config.Apps {
-			app := &config.Apps[i] // Pointer to modify if needed
-			expTime, exists := vc.expirationTracker[app.AppName]
-			if !exists {
-				log.Printf("App %s not found in expirationTracker, validate the config", app.AppName)
-				vc.ValidateConfig(config)
-			}
+	cleanupOldKeysTicker := time.NewTicker(1 * time.Minute) // Used for cleaning up old keys
+	defer cleanupOldKeysTicker.Stop()
 
-			ttlMinutes := int64(expTime.Sub(now).Minutes()) // Convert TTL to minutes
+	lastKeyCounts := make(map[string]int) // Store last fetched key counts
 
-			// Fetch Key Count
-			credentials, err := app.fetchApigeeKeys()
-			if err != nil {
-				log.Printf("❌ Failed to fetch keys for %s: %v", app.AppName, err)
-				continue
-			}
-			keyCount := len(credentials)
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
 
-			// Update Prometheus metrics
-			apigeeSecretRotate.WithLabelValues(app.AppName, fmt.Sprintf("%d", ttlMinutes), fmt.Sprintf("%d", keyCount)).Set(float64(keyCount))
+			for i := range config.Apps {
+				app := &config.Apps[i]
+				expTime, exists := vc.expirationTracker[app.AppName]
 
-			// Check if key rotation is needed
-			if now.After(expTime) {
-				log.Printf("🚨 TTL expired for %s, triggering key rotation...", app.AppName)
-
-				err := app.rotateApigeeKeys(vc)
-				if err != nil {
-					log.Printf("❌ Failed to rotate key for %s: %v", app.AppName, err)
+				if !exists {
+					log.Printf("WARNING: App %s not found in expirationTracker, skipping rotation check", app.AppName)
+					expirationTime := time.Now().Add(ttlDuration) // Set expiration using TTL
+					vc.expirationTracker[app.AppName] = expirationTime
 					continue
 				}
 
-				delete(vc.expirationTracker, app.AppName) // Remove expired entry
+				ttlMinutes := int64(expTime.Sub(now).Minutes())
+
+				// Update Prometheus metric for TTL and key count
+				metrics.ApigeeSecretRotate.WithLabelValues(
+					app.AppName, fmt.Sprintf("%d", ttlMinutes), fmt.Sprintf("%d", lastKeyCounts[app.AppName]),
+				).Set(float64(lastKeyCounts[app.AppName]))
+
+				if now.After(expTime) {
+					log.Printf("TTL expired for %s, triggering key rotation...", app.AppName)
+
+					err := app.rotateApigeeKeys(vc)
+					if err != nil {
+						log.Printf("Failed to rotate key for %s: %v", app.AppName, err)
+						continue
+					}
+
+					// Update expirationTracker
+					newExpTime := now.Add(ttlDuration)
+					vc.expirationTracker[app.AppName] = newExpTime
+				}
+			}
+
+		case <-keyCountUpdateTicker.C: // Fetch key count every 1 hour
+			for i := range config.Apps {
+				app := &config.Apps[i]
+				credentials, err := app.fetchApigeeKeys()
+				if err != nil {
+					log.Printf("Failed to fetch keys for %s: %v", app.AppName, err)
+					continue
+				}
+				lastKeyCounts[app.AppName] = len(credentials) // Cache the key count
+
+				// Update Prometheus metric for key count
+				metrics.ApigeeSecretRotate.WithLabelValues(
+					app.AppName, "TTL-NA", fmt.Sprintf("%d", len(credentials)),
+				).Set(float64(len(credentials)))
+			}
+
+		case <-cleanupOldKeysTicker.C: // Cleanup old keys every 72 hours
+			log.Println("Running cleanup of old keys...")
+
+			for i := range config.Apps {
+				app := &config.Apps[i]
+				err := vc.cleanupOldKeys(app)
+				if err != nil {
+					log.Printf("Failed to cleanup old keys for %s: %v", app.AppName, err)
+				}
 			}
 		}
+	}
+}
+
+func (vc *VaultClient) cleanupOldKeys(app *AppConfig) error {
+	log.Printf("Starting key cleanup for %s...", app.AppName)
+
+	// Step 1: Fetch all keys from Apigee
+	apigeeKeys, err := app.fetchApigeeKeys()
+	if err != nil {
+		log.Printf("Failed to fetch Apigee keys for %s: %v", app.AppName, err)
+		return err
+	}
+
+	// Skip Vault check if only 1 key exists
+	if len(apigeeKeys) <= 1 {
+		log.Printf("Skipping cleanup for %s as only 1 key exists.", app.AppName)
+		return nil
+	}
+
+	// Step 2: Fetch the stored key from Vault
+	vaultData, err := vc.readVaultData(*app)
+	if err != nil {
+		log.Printf("Failed to fetch Vault data for %s: %v", app.AppName, err)
+		return err
+	}
+
+	// Step 3: Extract key values from Vault data
+	vaultKey, keyExists := vaultData["key"].(string)
+	if !keyExists {
+		log.Printf("WARNING: No valid key found in Vault for %s", app.AppName)
+	}
+
+	// Step 4: Compare Apigee keys with Vault key
+	apigeeKeySet := make(map[string]struct{}) // Store Apigee keys in a set
+	for _, cred := range apigeeKeys {
+		apigeeKeySet[cred.ConsumerKey] = struct{}{}
+	}
+
+	// Step 5: Identify keys to delete
+	var keysToDelete []string
+	for key := range apigeeKeySet {
+		if key != vaultKey { // Keep only the Vault-stored key
+			keysToDelete = append(keysToDelete, key)
+		}
+	}
+
+	// Step 6: Delete old keys (skip if only 1 key exists)
+	app.deleteCleanup(keysToDelete)
+
+	return nil
+}
+
+func (app *AppConfig) deleteCleanup(keysToDelete []string) {
+	for _, key := range keysToDelete {
+		log.Printf("Deleting old key %s for app: %s now...", key, app.AppName)
+
+		deleteURL := fmt.Sprintf("v1/organizations/%s/developers/%s/apps/%s/keys/%s",
+			app.Org, app.DeveloperEmail, app.AppName, key)
+
+		req, client, err := app.newApigeeRequest("DELETE", deleteURL, nil)
+		if err != nil {
+			log.Printf("Failed to create delete request for key %s (%s): %v", key, app.AppName, err)
+			continue
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("Request failed for key %s (%s): %v", key, app.AppName, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+			log.Printf("Failed to delete key %s for %s: received status %d", key, app.AppName, resp.StatusCode)
+			continue
+		}
+
+		log.Printf("Successfully deleted key %s for %s", key, app.AppName)
 	}
 }
 
@@ -730,16 +727,42 @@ func (vc *VaultClient) patchVaultExpiration(app *AppConfig, newExpiration time.T
 	return nil
 }
 
-// New
-func (vc *VaultClient) ValidateConfig(config *Config) {
-	ttlStr := os.Getenv("TTL")
-	ttlDuration, err := parseTTL(ttlStr)
-	fmt.Println("TTL:", ttlDuration)
+// Converts a cron expression into a TTL duration
+func parseCronToDuration(cronExpr string) (time.Duration, error) {
+	schedule, err := cron.ParseStandard(cronExpr)
 	if err != nil {
-		log.Fatalf("Invalid TTL format: %v", err)
+		return 0, fmt.Errorf("failed to parse cron expression: %w", err)
 	}
 
-	// Ensure expirationTracker is initialized
+	now := time.Now()
+	nextRun := schedule.Next(now)
+
+	ttlDuration := nextRun.Sub(now)
+	return ttlDuration, nil
+}
+
+// New
+func (vc *VaultClient) ValidateConfig(config *Config) {
+
+	// Read cron schedule from env
+	cronSchedule := os.Getenv("TTL_CRON") // Example: "0 0 * * 0" (Every Sunday)
+
+	// Convert cron schedule to duration
+	ttlDuration, err := parseCronToDuration(cronSchedule)
+	if err != nil {
+		log.Fatalf("Invalid cron format: %v", err)
+	}
+	fmt.Println("TTL Duration:", ttlDuration)
+
+	// // Process TTL into duration to add to tracker
+	// ttlStr := os.Getenv("TTL")
+	// ttlDuration, err := parseTTL(ttlStr)
+	// fmt.Println("TTL:", ttlDuration)
+	// if err != nil {
+	// 	log.Fatalf("Invalid TTL format: %v", err)
+	// }
+
+	// Ensure expirationTracker, keyDeletionTracker is initialized
 	if vc.expirationTracker == nil {
 		vc.expirationTracker = make(map[string]time.Time)
 	}
@@ -759,7 +782,7 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 			continue
 		}
 
-		// Handle possible expirationTime types
+		// Handle possible expirationTime types from KV-2
 		if rawExp, ok := appData["expirationTime"]; ok {
 			switch v := rawExp.(type) {
 			case string:
@@ -832,17 +855,6 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 			log.Printf("Stale entry: expirationTracker contains %s, but Vault entry is missing. Skipping...\n", app.AppName)
 			continue
 		}
-
-		// **Case iv: Check for multiple credentials even if keys exist in Vault**
-		// creds, err := app.fetchApigeeKeys()
-		// if err != nil {
-		// 	log.Printf("Failed to fetch Apigee keys for %s: %v", app.AppName, err)
-		// 	continue
-		// }
-
-		// if len(creds) > 1 {
-		// 	log.Printf("Warning: Multiple credentials returned for %s. Using the first one.", app.AppName)
-		// }
 
 		// Case iv)  All 4 fields exist, ideal case -> Track expiration
 		if existsInVault && existsKey && existsSecret && existsApp && existsExpiration {
