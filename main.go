@@ -433,15 +433,6 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 	ticker := time.NewTicker(keyRotationCheckDuration) // Watches the expiration time in the expirationTracker map
 	defer ticker.Stop()
 
-	// Interval for checking key count
-	keyCountCheckInterval := os.Getenv("KEY_COUNT_CHECK_INTERVAL")
-	keyCountCheckDuration, err := time.ParseDuration(keyCountCheckInterval)
-	if err != nil || keyCountCheckDuration <= 0 {
-		log.Fatalf("Invalid KEY_ROTATE_CHECK_INTERVAL: %v", err)
-	}
-	keyCountUpdateTicker := time.NewTicker(keyCountCheckDuration) // Fetch key count for metrics
-	defer keyCountUpdateTicker.Stop()
-
 	// Key deletion interval
 	keyDeletionInterval := os.Getenv("KEY_DELETION_INTERVAL")
 	keyDeletionDuration, err := time.ParseDuration(keyDeletionInterval)
@@ -474,9 +465,9 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 
 				ttlMinutes := int64(getNextCronTime().Sub(now).Minutes()) // ttl for prometheus metrics
 
-				// Update Prometheus metric for TTL and key count
+				// Update Prometheus metric for TTL
 				metrics.ApigeeSecretRotate.WithLabelValues(
-					app.AppName, fmt.Sprintf("%d", ttlMinutes), fmt.Sprintf("%d", lastKeyCounts[app.AppName]),
+					app.AppName, fmt.Sprintf("%d", ttlMinutes),
 				).Set(float64(lastKeyCounts[app.AppName]))
 
 				if now.After(expTime) {
@@ -488,22 +479,6 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 						continue
 					}
 				}
-			}
-
-		case <-keyCountUpdateTicker.C:
-			for i := range config.Apps {
-				app := &config.Apps[i]
-				credentials, err := app.fetchApigeeKeys()
-				if err != nil {
-					log.Printf("Failed to fetch keys for %s: %v", app.AppName, err)
-					continue
-				}
-				lastKeyCounts[app.AppName] = len(credentials) // Cache the key count
-
-				// Update Prometheus metric for key count
-				metrics.ApigeeSecretRotate.WithLabelValues(
-					app.AppName, "TTL-NA", fmt.Sprintf("%d", len(credentials)),
-				).Set(float64(len(credentials)))
 			}
 
 		case <-cleanupOldKeysTicker.C:

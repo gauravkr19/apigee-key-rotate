@@ -13,7 +13,7 @@ var ApigeeSecretRotate = prometheus.NewGaugeVec(
 		Name: "apigee_secret_rotate",
 		Help: "Tracks Apigee key rotation per app",
 	},
-	[]string{"appName", "TTL", "KeyCount"},
+	[]string{"appName", "TTL"},
 )
 
 // Initialize and register metrics
