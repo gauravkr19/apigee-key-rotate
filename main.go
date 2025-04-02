@@ -22,11 +22,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// var _ = prometheus.Handler() // Deprecated, but ensures import is used
 // VaultClient holds the Vault API client
 type VaultClient struct {
 	Client            *vault.Client
-	expirationTracker map[string]time.Time // Tracks when TTL expires
+	Role              string
+	AuthMethod        string
+	JWTPath           string
+	AuthMutex         sync.Mutex           // Prevent concurrent token refresh
+	ExpirationTracker map[string]time.Time // Tracks when TTL expires
 }
 
 type Credential struct {
@@ -76,12 +79,11 @@ type ApigeeResponse struct {
 var apigeeConfig ApigeeConfig // Global Apigee configuration
 var cronSchedule string       // Global variable to store user-defined cron
 
-// NewVaultClient initializes and returns a Vault API client
 func NewVaultClient() (*VaultClient, error) {
 	vaultAddr := os.Getenv("VAULT_ADDR")
 	vaultRole := os.Getenv("VAULT_ROLE")
 	vaultAuthMethod := os.Getenv("VAULT_AUTH_METHOD")
-	useTLS := os.Getenv("VAULT_USE_TLS") == "false" // Defaults to false
+	useTLS := os.Getenv("VAULT_USE_TLS") != "false" // Defaults to true
 
 	config := vault.DefaultConfig()
 	config.Address = vaultAddr
@@ -93,13 +95,11 @@ func NewVaultClient() (*VaultClient, error) {
 		// Check if CA certificate is provided
 		caCertPath := os.Getenv("VAULT_CACERT")
 		if caCertPath != "" {
-			// Load CA certificate
 			caCert, err := os.ReadFile(caCertPath)
 			if err != nil {
 				log.Println("Failed to read CA certificate:", err)
 			}
 
-			// Create a certificate pool and append the CA certificate
 			caCertPool := x509.NewCertPool()
 			if caCertPool.AppendCertsFromPEM(caCert) {
 				tlsConfig.CACert = caCertPath
@@ -108,12 +108,10 @@ func NewVaultClient() (*VaultClient, error) {
 				log.Println("Failed to append CA certificate to pool")
 			}
 		} else {
-			// If no CA certificate is provided, use InsecureSkipVerify
 			tlsConfig.Insecure = true
 			log.Println("No CA certificate provided. Using InsecureSkipVerify=true for TLS.")
 		}
 
-		// Apply TLS settings
 		if err := config.ConfigureTLS(&tlsConfig); err != nil {
 			return nil, fmt.Errorf("TLS configuration error: %v", err)
 		}
@@ -127,29 +125,53 @@ func NewVaultClient() (*VaultClient, error) {
 		return nil, fmt.Errorf("Failed to create Vault client: %v", err)
 	}
 
-	// Read Kubernetes JWT Token
-	jwtToken, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
-	if err != nil {
-		return nil, fmt.Errorf("Failed to read service account JWT token: %v", err)
+	vc := &VaultClient{
+		Client:            client,
+		Role:              vaultRole,
+		AuthMethod:        vaultAuthMethod,
+		JWTPath:           "/var/run/secrets/kubernetes.io/serviceaccount/token",
+		ExpirationTracker: make(map[string]time.Time),
 	}
 
-	// Authenticate with Vault using Kubernetes Auth
-	authPayload := map[string]interface{}{
-		"jwt":  string(jwtToken),
-		"role": vaultRole,
+	// Perform initial authentication
+	if err := vc.authenticate(); err != nil {
+		return nil, err
 	}
 
-	authPath := fmt.Sprintf("auth/%s/login", vaultAuthMethod)
-	secret, err := client.Logical().Write(authPath, authPayload)
-	if err != nil {
-		return nil, fmt.Errorf("Vault authentication failed: %v", err)
-	}
-
-	// Set Vault token
-	client.SetToken(secret.Auth.ClientToken)
 	log.Println("Successfully authenticated with Vault")
 
-	return &VaultClient{Client: client}, nil
+	return vc, nil
+}
+
+// NewVaultClient initializes and returns a Vault API client
+func (vc *VaultClient) authenticate() error {
+	vc.AuthMutex.Lock()
+	defer vc.AuthMutex.Unlock()
+
+	jwtToken, err := os.ReadFile(vc.JWTPath)
+	if err != nil {
+		return fmt.Errorf("Failed to read service account JWT token: %w", err)
+	}
+
+	authPayload := map[string]interface{}{
+		"jwt":  string(jwtToken),
+		"role": vc.Role,
+	}
+
+	authPath := fmt.Sprintf("auth/%s/login", vc.AuthMethod)
+	secret, err := vc.Client.Logical().Write(authPath, authPayload)
+	if err != nil {
+		return fmt.Errorf("Vault authentication failed: %w", err)
+	}
+
+	if secret.Auth == nil || secret.Auth.ClientToken == "" {
+		return fmt.Errorf("Received empty token from Vault")
+	}
+
+	vc.Client.SetToken(secret.Auth.ClientToken)
+	// log.Println("Re-authenticated with Vault")
+
+	return nil
 }
 
 // initializeApigeeConfig sets up the Apigee configuration and HTTP client
@@ -261,7 +283,7 @@ func (app *AppConfig) rotateApigeeKeys(vc *VaultClient) error {
 
 		// renew expiration time and update tracker and Vault
 		newExpirationTime := getNextCronTime()
-		vc.expirationTracker[app.AppName] = newExpirationTime
+		vc.ExpirationTracker[app.AppName] = newExpirationTime
 
 		// Write to Vault before deleting old key
 		err = vc.WriteToVault(*app, newKey, newSecret, newExpirationTime)
@@ -430,7 +452,7 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 	if err != nil || keyRotationCheckDuration <= 0 {
 		log.Fatalf("Invalid KEY_ROTATE_CHECK_INTERVAL: %v", err)
 	}
-	ticker := time.NewTicker(keyRotationCheckDuration) // Watches the expiration time in the expirationTracker map
+	ticker := time.NewTicker(keyRotationCheckDuration) // Watches the expiration time in the ExpirationTracker map
 	defer ticker.Stop()
 
 	// Key deletion interval
@@ -449,11 +471,11 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 
 			for i := range config.Apps {
 				app := &config.Apps[i]
-				expTime, exists := vc.expirationTracker[app.AppName]
+				expTime, exists := vc.ExpirationTracker[app.AppName]
 				if !exists {
-					log.Printf("WARNING: App %s not found in expirationTracker, skipping rotation check", app.AppName)
+					log.Printf("WARNING: App %s not found in ExpirationTracker, skipping rotation check", app.AppName)
 					expirationTime := getNextCronTime() // Set expiration using cron
-					vc.expirationTracker[app.AppName] = expirationTime
+					vc.ExpirationTracker[app.AppName] = expirationTime
 					err := vc.patchVaultExpiration(app, expirationTime)
 					if err != nil {
 						log.Printf("Failed to patch expiration for %s: %v", app.AppName, err)
@@ -508,6 +530,10 @@ func (vc *VaultClient) cleanupOldKeys(app *AppConfig) error {
 		return nil
 	}
 
+	// Refresh client token
+	if err := vc.authenticate(); err != nil {
+		return fmt.Errorf("Vault authentication failed: %w", err)
+	}
 	// Step 2: Fetch the stored key from Vault
 	vaultData, err := vc.readVaultData(*app)
 	if err != nil {
@@ -600,6 +626,10 @@ func (vc *VaultClient) batchReadVaultData(apps []AppConfig) map[string]map[strin
 
 // New
 func (vc *VaultClient) readVaultData(app AppConfig) (map[string]interface{}, error) {
+	// Refresh client token
+	if err := vc.authenticate(); err != nil {
+		return nil, fmt.Errorf("Vault authentication failed: %w", err)
+	}
 	vaultPath := fmt.Sprintf("%s/data/%s", app.VaultMount, app.VaultPath)
 	secret, err := vc.Client.Logical().Read(vaultPath)
 	if err != nil {
@@ -621,6 +651,10 @@ func (vc *VaultClient) readVaultData(app AppConfig) (map[string]interface{}, err
 
 // New
 func (vc *VaultClient) WriteToVault(app AppConfig, key, secret string, expirationTime time.Time) error {
+	// Refresh client token
+	if err := vc.authenticate(); err != nil {
+		return fmt.Errorf("Vault authentication failed: %w", err)
+	}
 	vaultPath := fmt.Sprintf("%s/data/%s", app.VaultMount, app.VaultPath)
 	data := map[string]interface{}{
 		"data": map[string]interface{}{
@@ -642,9 +676,9 @@ func (vc *VaultClient) WriteToVault(app AppConfig, key, secret string, expiratio
 
 // New
 func (vc *VaultClient) patchVaultExpiration(app *AppConfig, newExpiration time.Time) error {
-	// Ensure Vault client is available
-	if vc.Client == nil {
-		return fmt.Errorf("Vault client is not initialized")
+	// Refresh client token
+	if err := vc.authenticate(); err != nil {
+		return fmt.Errorf("Vault authentication failed: %w", err)
 	}
 
 	// Construct Vault path
@@ -676,7 +710,7 @@ func (vc *VaultClient) patchVaultExpiration(app *AppConfig, newExpiration time.T
 	}
 
 	// Update in-memory expiration tracker
-	vc.expirationTracker[app.AppName] = newExpiration
+	vc.ExpirationTracker[app.AppName] = newExpiration
 
 	// Optionally, update the struct field for consistency
 	app.ExpirationTime = newExpiration
@@ -706,9 +740,9 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 	}
 	log.Println("Key expiration Time from cron:", getNextCronTime())
 
-	// Ensure expirationTracker, keyDeletionTracker is initialized
-	if vc.expirationTracker == nil {
-		vc.expirationTracker = make(map[string]time.Time)
+	// Ensure ExpirationTracker, keyDeletionTracker is initialized
+	if vc.ExpirationTracker == nil {
+		vc.ExpirationTracker = make(map[string]time.Time)
 	}
 
 	// Parallel batch read from Vault
@@ -750,7 +784,7 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 			if expirationTime.Before(time.Now()) {
 				log.Printf("Vault's expirationTime field is invalid for %s. Resetting expiration time...\n", app.AppName)
 				newExpiration := getNextCronTime()
-				vc.expirationTracker[app.AppName] = newExpiration
+				vc.ExpirationTracker[app.AppName] = newExpiration
 				app.ExpirationTime = newExpiration
 
 				// PATCH only expirationTime in Vault
@@ -773,7 +807,7 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 			}
 
 			expTime := getNextCronTime() // Set expiration using TTL
-			vc.expirationTracker[app.AppName] = expTime
+			vc.ExpirationTracker[app.AppName] = expTime
 
 			// Write key & expiration to Vault
 			err = vc.WriteToVault(app, creds[0].ConsumerKey, creds[0].ConsumerSecret, expTime)
@@ -783,17 +817,17 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 			continue
 		}
 
-		// Case iii) Vault entry exists, but missing in expirationTracker -> Refresh map
+		// Case iii) Vault entry exists, but missing in ExpirationTracker -> Refresh map
 		if existsInVault && !vc.hasExpirationTrackerEntry(app.AppName) {
-			log.Printf(" Vault entry exists for %s, but missing from expirationTracker. Refreshing...\n", app.AppName)
+			log.Printf(" Vault entry exists for %s, but missing from ExpirationTracker. Refreshing...\n", app.AppName)
 			expTime, _ := time.Parse(time.RFC3339, expirationTimeStr)
-			vc.expirationTracker[app.AppName] = expTime
+			vc.ExpirationTracker[app.AppName] = expTime
 			continue
 		}
 
-		// Vault entry is missing, but expirationTracker entry exists - unlikely
+		// Vault entry is missing, but ExpirationTracker entry exists - unlikely
 		if !existsInVault && vc.hasExpirationTrackerEntry(app.AppName) {
-			log.Printf("Stale entry: expirationTracker contains %s, but Vault entry is missing. Skipping...\n", app.AppName)
+			log.Printf("Stale entry: ExpirationTracker contains %s, but Vault entry is missing. Skipping...\n", app.AppName)
 			continue
 		}
 
@@ -810,20 +844,20 @@ func (vc *VaultClient) ValidateConfig(config *Config) {
 			}
 
 			// Track expiration
-			vc.expirationTracker[app.AppName] = expirationTime
+			vc.ExpirationTracker[app.AppName] = expirationTime
 			continue
 		}
 	}
 	log.Printf("Validation complete, tracking the TTLs until key expiration for each of the apps")
 
 	// Start expiration watcher only if there are valid tracked entries
-	if len(vc.expirationTracker) > 0 {
+	if len(vc.ExpirationTracker) > 0 {
 		go vc.expirationWatcher(config)
 	}
 }
 
 func (vc *VaultClient) hasExpirationTrackerEntry(appName string) bool {
-	_, exists := vc.expirationTracker[appName]
+	_, exists := vc.ExpirationTracker[appName]
 	return exists
 }
 
