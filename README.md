@@ -3,7 +3,7 @@
 This service automates Apigee Consumer Key and Secret rotation and securely stores the new credentials in HashiCorp Vault. Since Vault does not provide a native Apigee backend, this custom solution handles key lifecycle management while integrating with Vault’s KV2 secrets engine.
 
 ## How It Works
-<img width="1100" alt="image" src="https://github.com/user-attachments/assets/facf6b1f-e32b-4ad9-8386-730991260bc6" />  
+<img width="1100" alt="image" src="https://github.com/user-attachments/assets/a97eb521-2441-4b92-8aab-a42182a3cd3e" />
 
 #
 * **Key Rotation**: Periodically creates a new Apigee key, associates it with the Developer App, and removes old keys.
