@@ -1,0 +1,112 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apigee-key-rotator
+  labels:
+    app: apigee-key-rotator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apigee-key-rotator
+  template:
+    metadata:
+      labels:
+        app: apigee-key-rotator
+    spec:
+      securityContext:
+        runAsNonRoot: true  
+        runAsUser: 1000
+        fsGroup: 1000        
+      containers:
+        - name: apigee-key-rotator
+          image: docker.io/gauravkr19/apigee-rotate:v2   
+          workingDir: /app   
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          env:
+            - name: APIGEE_URL
+              value: "http://10.11.10.1:8080"
+            - name: APIGEE_USERNAME
+              value: "gaurav.kumar@example.com"
+            - name: APIGEE_PASSWORD
+              value: "SomePass"
+            - name: APIGEE_SKIP_TLS_VERIFY
+              value: "true"
+            - name: KEY_ROTATION_CHECK_INTERVAL
+              value: "1m"
+            - name: KEY_DELETION_INTERVAL
+              value: "30m"
+            - name: TTL_CRON
+              value: "0 * * * *"  
+            - name: VAULT_ADDR
+              value: "https://vault-ui-dev.apps.ocp.example.com"
+            - name: VAULT_USE_TLS
+              value: "true"
+            - name: VAULT_ROLE
+              value: "apigee-rotate"
+            - name: VAULT_AUTH_METHOD
+              value: "jwt"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: tmpfs
+              mountPath: /tmp
+            - name: config-volume
+              mountPath: /app/config.yaml   
+              subPath: config.yaml          
+              readOnly: true               
+      volumes:
+        - name: tmpfs
+          emptyDir: {}
+        - name: config-volume
+          configMap:
+            name: apigee-config          
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apigee-key-rotator
+  labels:
+    app: apigee-key-rotator
+spec:
+  selector:
+    app: apigee-key-rotator 
+  ports:
+    - name: http-metrics
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: apigee-key-rotator-monitor
+spec:
+  selector:
+    matchLabels:
+      app: apigee-key-rotator   
+  endpoints:
+    - port: http-metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apigee-config      
+data:
+  config.yaml: |
+    apps:
+      - org: "org-nonprod"
+        developer_email: "gaurav.kumar@example.com"
+        app_name: "My_New_App"
+        vault_mount: "ngildb"
+        vault_path: "tibco-bwce/My_New_App/uat"
+
+      - org: "org-nonprod"
+        developer_email: "gaurav.kumar@example.com"
+        app_name: "New_App_test1"
+        vault_mount: "ngildb"
+        vault_path: "tibco-bwce/New_App_test1/uat" 
+
+      - org: "org-nonprod"
+        developer_email: "gaurav.kumar@example.com"
+        app_name: "MyNewApp1"
+        vault_mount: "ngildb"
+        vault_path: "tibco-bwce/MyNewApp1/uat"     
+        
+      - org: "org-nonprod"
+        developer_email: "gaurav.kumar@example.com"
+        app_name: "MyApp"
+        vault_mount: "ngildb"
+        vault_path: "nodejs/MyApp/uat"     
+  
+
