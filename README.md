@@ -11,7 +11,7 @@ This service automates Apigee Consumer Key and Secret rotation and securely stor
 ValidateConfig uses batchReadVaultData to read vault concurrently which returns a map with Vault data. This map provides the data to accomplish all the tasks in this function.
 **ValidateConfig** also uses **patchVaultExpiration** to update stale  expiration time caught during entrypoint. It then finally calls expirationWatcher.
 
->**Step 3**:\
+> **Step 3**:\
 > **expirationWatcher** is used to perform two tasks. i) tracking the expiration of key, secret and calling rotate function when key is expired and ii) Deletes the old key from apigee.  Both these tasks are performed periodically.  
 env **KEY_ROTATION_CHECK_INTERVAL**: how frequently the code should check for password expiration, set as 1m.\
 env **KEY_DELETION_INTERVAL**:  how frequently the code should delete  duplicate keys.\
@@ -23,7 +23,7 @@ expirationWatcher also uses **rotateApigeeKeys** to rotate the keys.
 **rotateApigeeKeys** then writes the keys, secret and expirationTime to Vault via **WriteToVault**. 
 
 
-#
+## Features
 * **Key Rotation**: Periodically creates a new Apigee key, associates it with the Developer App, and removes old keys.
 * **Vault Integration**: Stores the latest Consumer Key and Secret in Vault’s KV2 backend.
 * **TTL-Based Cleanup**: Ensures expired keys are removed at scheduled intervals.
