@@ -79,6 +79,7 @@ type ApigeeResponse struct {
 var apigeeConfig ApigeeConfig // Global Apigee configuration
 var cronSchedule string       // Global variable to store user-defined cron
 
+// func NewVaultClient initializes vault and returns a Vault API client
 func NewVaultClient() (*VaultClient, error) {
 	vaultAddr := os.Getenv("VAULT_ADDR")
 	vaultRole := os.Getenv("VAULT_ROLE")
@@ -143,7 +144,7 @@ func NewVaultClient() (*VaultClient, error) {
 	return vc, nil
 }
 
-// NewVaultClient initializes and returns a Vault API client
+// func authenticate authenticates to vault using k8s/jwt auth method
 func (vc *VaultClient) authenticate() error {
 	vc.AuthMutex.Lock()
 	defer vc.AuthMutex.Unlock()
@@ -174,7 +175,7 @@ func (vc *VaultClient) authenticate() error {
 	return nil
 }
 
-// initializeApigeeConfig sets up the Apigee configuration and HTTP client
+// func initializeApigeeConfig sets up the Apigee configuration and HTTP client
 func initializeApigeeConfig() error {
 	apigeeConfig = ApigeeConfig{
 		BaseURL:       os.Getenv("APIGEE_URL"),
@@ -226,7 +227,7 @@ func (app *AppConfig) newApigeeRequest(method, endpoint string, body io.Reader) 
 	return req, apigeeConfig.HTTPClient, nil
 }
 
-// rotateApigeeKeys retrieves the keys, products, creates keys, associate with products and delete old key
+// func rotateApigeeKeys retrieves the keys, products, creates keys, associate with products and delete old key
 func (app *AppConfig) rotateApigeeKeys(vc *VaultClient) error {
 	req, client, err := app.newApigeeRequest("GET", fmt.Sprintf("v1/organizations/%s/developers/%s/apps/%s", app.Org, app.DeveloperEmail, app.AppName), nil)
 
@@ -297,7 +298,7 @@ func (app *AppConfig) rotateApigeeKeys(vc *VaultClient) error {
 	return nil
 }
 
-// fetchApigeeKeys retrieves the keys, products to validate
+// func fetchApigeeKeys retrieves the keys, products from apigee to validate
 func (app *AppConfig) fetchApigeeKeys() ([]Credential, error) {
 	req, client, err := app.newApigeeRequest("GET", fmt.Sprintf("v1/organizations/%s/developers/%s/apps/%s", app.Org, app.DeveloperEmail, app.AppName), nil)
 
@@ -340,7 +341,7 @@ func (app *AppConfig) fetchApigeeKeys() ([]Credential, error) {
 	return apiResp.Credentials, nil
 }
 
-// createApigeeKey first creates a key, then associates API products.
+// func createApigeeKey first creates a key, then associates API products.
 func (app *AppConfig) createApigeeKey(key, secret string) error {
 	// Step 1: Create the Key
 	createPayload := map[string]string{
@@ -398,7 +399,7 @@ func (app *AppConfig) createApigeeKey(key, secret string) error {
 	return nil
 }
 
-// generateSecureKey generates a secure key of the given length using a mix of uppercase, lowercase, and digits.
+// func generateSecureKey generates a secure key of the given length using a mix of uppercase, lowercase, and digits.
 func generateSecureKey(length int) (string, error) {
 	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 	bytes := make([]byte, length)
@@ -415,7 +416,7 @@ func generateSecureKey(length int) (string, error) {
 	return string(bytes), nil
 }
 
-// generateCredentials generates a secure consumer key and secret.
+// func generateCredentials generates a secure consumer key and secret.
 func generateCredentials() (string, string, error) {
 	consumerKey, err := generateSecureKey(32) // 32-char secure key
 	if err != nil {
@@ -444,8 +445,9 @@ func ReadConfig(filename string) (*Config, error) {
 	return &config, nil
 }
 
+// func expirationWatcher tracks the TTL expiration of key, secret
 func (vc *VaultClient) expirationWatcher(config *Config) {
-
+	
 	// TTL for key rotation
 	keyRotationCheckInterval := os.Getenv("KEY_ROTATION_CHECK_INTERVAL")
 	keyRotationCheckDuration, err := time.ParseDuration(keyRotationCheckInterval) // example values for env "5m", "1h", "30s", "24h", etc.
@@ -455,7 +457,7 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 	ticker := time.NewTicker(keyRotationCheckDuration) // Watches the expiration time in the ExpirationTracker map
 	defer ticker.Stop()
 
-	// Key deletion interval
+	// KEY_DELETION_INTERVAL - Interval when to delete the duplicate keys
 	keyDeletionInterval := os.Getenv("KEY_DELETION_INTERVAL")
 	keyDeletionDuration, err := time.ParseDuration(keyDeletionInterval)
 	if err != nil || keyDeletionDuration <= 0 {
@@ -514,6 +516,7 @@ func (vc *VaultClient) expirationWatcher(config *Config) {
 	}
 }
 
+// func cleanupOldKeys compares keys from vault and apigee and deletes the duplicate key from apigee
 func (vc *VaultClient) cleanupOldKeys(app *AppConfig) error {
 	// log.Printf("Starting key cleanup for %s...", app.AppName)
 
@@ -567,6 +570,7 @@ func (vc *VaultClient) cleanupOldKeys(app *AppConfig) error {
 	return nil
 }
 
+// func deleteCleanup deletes the key from apigee
 func (app *AppConfig) deleteCleanup(keysToDelete []string) {
 	for _, key := range keysToDelete {
 		log.Printf("Deleting old key for app: %s now...", app.AppName)
@@ -596,7 +600,7 @@ func (app *AppConfig) deleteCleanup(keysToDelete []string) {
 	}
 }
 
-// // concurrent read via goroutine
+// fun batchReadVaultData performs concurrent read via goroutine
 func (vc *VaultClient) batchReadVaultData(apps []AppConfig) map[string]map[string]interface{} {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -624,7 +628,7 @@ func (vc *VaultClient) batchReadVaultData(apps []AppConfig) map[string]map[strin
 	return results
 }
 
-// New
+// func readVaultData reads 
 func (vc *VaultClient) readVaultData(app AppConfig) (map[string]interface{}, error) {
 	// Refresh client token
 	if err := vc.authenticate(); err != nil {
@@ -649,7 +653,7 @@ func (vc *VaultClient) readVaultData(app AppConfig) (map[string]interface{}, err
 	}, nil
 }
 
-// New
+// func WriteToVault writes app, key, secret and expiration time to vault
 func (vc *VaultClient) WriteToVault(app AppConfig, key, secret string, expirationTime time.Time) error {
 	// Refresh client token
 	if err := vc.authenticate(); err != nil {
@@ -674,7 +678,7 @@ func (vc *VaultClient) WriteToVault(app AppConfig, key, secret string, expiratio
 	return nil
 }
 
-// New
+// func patchVaultExpiration patches only the missing expiration time
 func (vc *VaultClient) patchVaultExpiration(app *AppConfig, newExpiration time.Time) error {
 	// Refresh client token
 	if err := vc.authenticate(); err != nil {
@@ -731,7 +735,7 @@ func getNextCronTime() time.Time {
 	return nextRun
 }
 
-// New
+// func ValidateConfig performs several checks, during entrypoint,  like oboarding apps to vault, etc.
 func (vc *VaultClient) ValidateConfig(config *Config) {
 
 	cronSchedule = os.Getenv("TTL_CRON") // Example: "0 0 * * 0" (Every Sunday)
