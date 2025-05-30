@@ -628,7 +628,7 @@ func (vc *VaultClient) batchReadVaultData(apps []AppConfig) map[string]map[strin
 	return results
 }
 
-// func readVaultData reads 
+// func readVaultData reads vault kv2
 func (vc *VaultClient) readVaultData(app AppConfig) (map[string]interface{}, error) {
 	// Refresh client token
 	if err := vc.authenticate(); err != nil {
