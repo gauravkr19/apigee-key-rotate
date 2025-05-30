@@ -2,7 +2,19 @@
 ## Overview
 This service automates Apigee Consumer Key and Secret rotation and securely stores the new credentials in HashiCorp Vault. Since Vault does not provide a native Apigee backend, this custom solution handles key lifecycle management while integrating with Vault’s KV2 secrets engine.
 
-## How It Works
+## Implementation logic
+The basic logic behind the code is:
+1.	Pass inputs via config.yaml (org, developer-email, app, vaultpath/mount). 
+2.	For every app, the code creates key, secret and sets and expiration-time and writes it to Vault.
+3.	Key/secret expiration is tracked via a map
+4.	Before key expiration,  create a new key/secret + associate api products.
+5.	A separate routine runs every few mins to delete the old key/secret.
+
+Note:
+* The code performs deletion only when there is more than 1 key for the app.
+* When deleting, a check is done by comparing the key/secret in Vault, so that we do not delete the active key in apigee.
+
+## Code Workflow
 > **Step 1**:\
 > Initializes Apigee using HTTP client, vault client, validates all environment variables, and uses ValidateConfig to build the ExpirationTracker map.
 
