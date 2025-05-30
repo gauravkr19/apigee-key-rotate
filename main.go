@@ -880,6 +880,7 @@ var requiredEnvVars = []string{
 	"TTL_CRON",
 }
 
+// func checkEnvVars proceeds with code exec only when inputs are passed via env
 func checkEnvVars() {
 	for _, env := range requiredEnvVars {
 		if os.Getenv(env) == "" {
